@@ -65,7 +65,7 @@ void WINAPI ServiceMain(DWORD argc, LPTSTR *argv)
     if (clientSocket == INVALID_SOCKET)
     {
         fprintf(stderr, "创建套接字时出错\n");
-        return 1;
+        return;
     }
 
     struct sockaddr_in serverAddr;
